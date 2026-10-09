@@ -44,21 +44,27 @@ impl Board {
         }
     }
 
-    pub fn clear_lines(&mut self) -> u32 {
-        let mut cleared = 0u32;
-        let mut y = HEIGHT as i32 - 1;
-        while y >= 0 {
-            let row_full = (0..WIDTH).all(|x| self.grid[y as usize][x].is_some());
-            if row_full {
-                cleared += 1;
-                for row in (1..=y as usize).rev() {
-                    self.grid[row] = self.grid[row - 1];
-                }
-                self.grid[0] = [None; WIDTH];
-            } else {
-                y -= 1;
+    pub fn full_rows(&self) -> Vec<usize> {
+        (0..HEIGHT)
+            .filter(|&y| (0..WIDTH).all(|x| self.grid[y][x].is_some()))
+            .collect()
+    }
+
+    pub fn clear_rows(&mut self, rows: &[usize]) -> u32 {
+        if rows.is_empty() {
+            return 0;
+        }
+        let remove: std::collections::HashSet<usize> = rows.iter().copied().collect();
+        let mut new_grid = [[None; WIDTH]; HEIGHT];
+        let mut write = HEIGHT;
+        for y in (0..HEIGHT).rev() {
+            if !remove.contains(&y) {
+                write -= 1;
+                new_grid[write] = self.grid[y];
             }
         }
+        let cleared = write as u32;
+        self.grid = new_grid;
         cleared
     }
 
@@ -68,5 +74,59 @@ impl Board {
 
     pub fn reset(&mut self) {
         self.grid = [[None; WIDTH]; HEIGHT];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fill_row(board: &mut Board, row: usize, t: TetrominoType) {
+        for col in 0..WIDTH {
+            board.grid[row][col] = Some(t);
+        }
+    }
+
+    #[test]
+    fn full_rows_detects_complete_rows() {
+        let mut board = Board::new();
+        board.grid[18][0] = Some(TetrominoType::I);
+        assert_eq!(board.full_rows(), Vec::<usize>::new());
+        fill_row(&mut board, 19, TetrominoType::I);
+        assert_eq!(board.full_rows(), vec![19]);
+    }
+
+    #[test]
+    fn clear_rows_removes_and_shifts() {
+        let mut board = Board::new();
+        fill_row(&mut board, 19, TetrominoType::I);
+        board.grid[17][0] = Some(TetrominoType::T);
+
+        assert_eq!(board.clear_rows(&[19]), 1);
+        assert!(board.full_rows().is_empty());
+        assert_eq!(board.cell(18, 0), Some(TetrominoType::T));
+        assert_eq!(board.cell(19, 0), None);
+    }
+
+    #[test]
+    fn clear_rows_handles_multiple_non_adjacent() {
+        let mut board = Board::new();
+        fill_row(&mut board, 15, TetrominoType::I);
+        board.grid[18][0] = Some(TetrominoType::O);
+        fill_row(&mut board, 19, TetrominoType::J);
+        board.grid[18][5] = Some(TetrominoType::T);
+
+        assert_eq!(board.clear_rows(&[15, 19]), 2);
+        assert_eq!(board.cell(19, 0), Some(TetrominoType::O));
+        assert_eq!(board.cell(19, 5), Some(TetrominoType::T));
+        assert_eq!(board.cell(18, 0), None);
+    }
+
+    #[test]
+    fn clear_rows_empty_slice_noop() {
+        let mut board = Board::new();
+        board.grid[0][1] = Some(TetrominoType::T);
+        assert_eq!(board.clear_rows(&[]), 0);
+        assert_eq!(board.cell(0, 1), Some(TetrominoType::T));
     }
 }

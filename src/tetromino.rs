@@ -94,9 +94,41 @@ pub fn get_color(t: TetrominoType) -> Color {
     }
 }
 
-pub fn random_type() -> TetrominoType {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    TYPE_INDEX[rng.gen_range(0..7)]
+pub struct Bag {
+    queue: Vec<TetrominoType>,
+}
+
+impl Bag {
+    pub fn new() -> Self {
+        Bag { queue: Vec::new() }
+    }
+
+    pub fn next(&mut self) -> TetrominoType {
+        if self.queue.is_empty() {
+            use rand::seq::SliceRandom;
+            self.queue = TYPE_INDEX.to_vec();
+            self.queue.shuffle(&mut rand::thread_rng());
+        }
+        self.queue.pop().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bag_yields_all_seven_types_every_seven_draws() {
+        let mut bag = Bag::new();
+        for _ in 0..2 {
+            let mut drawn = Vec::new();
+            for _ in 0..7 {
+                drawn.push(bag.next());
+            }
+            for t in TYPE_INDEX {
+                assert_eq!(drawn.iter().filter(|&&d| d == t).count(), 1);
+            }
+        }
+    }
 }
 

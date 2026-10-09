@@ -1,6 +1,18 @@
 use crate::board::Board;
-use crate::tetromino::{get_shape, random_type, TetrominoType};
+use crate::tetromino::{get_shape, Bag, TetrominoType};
 use macroquad::input::{is_key_down, is_key_pressed, KeyCode};
+
+pub const CLEAR_DURATION: f64 = 0.35;
+
+#[derive(Debug)]
+pub enum GameEvent {
+    Rotated,
+    HardDropped,
+    Held,
+    LinesCleared { rows: Vec<usize>, points: u32 },
+    LevelUp { level: u32 },
+    GameOver,
+}
 
 pub struct Game {
     pub board: Board,
@@ -8,11 +20,17 @@ pub struct Game {
     pub current_rotation: usize,
     pub pos: (i32, i32),
     pub next_type: TetrominoType,
+    pub hold_type: Option<TetrominoType>,
+    pub hold_used: bool,
+    pub clear_timer: f64,
+    pub pending_clear_rows: Vec<usize>,
     pub score: u32,
     pub level: u32,
     pub lines_cleared: u32,
     pub game_over: bool,
     pub paused: bool,
+    bag: Bag,
+    events: Vec<GameEvent>,
     fall_timer: f64,
     fall_interval: f64,
     das_timer_left: f64,
@@ -22,8 +40,9 @@ pub struct Game {
 
 impl Game {
     pub fn new() -> Self {
-        let current_type = random_type();
-        let next_type = random_type();
+        let mut bag = Bag::new();
+        let current_type = bag.next();
+        let next_type = bag.next();
         let pos = Self::spawn_pos(current_type);
         Game {
             board: Board::new(),
@@ -31,11 +50,17 @@ impl Game {
             current_rotation: 0,
             pos,
             next_type,
+            hold_type: None,
+            hold_used: false,
+            clear_timer: 0.0,
+            pending_clear_rows: Vec::new(),
             score: 0,
             level: 1,
             lines_cleared: 0,
             game_over: false,
             paused: false,
+            bag,
+            events: Vec::new(),
             fall_timer: 0.0,
             fall_interval: 0.8,
             das_timer_left: 0.0,
@@ -54,12 +79,57 @@ impl Game {
 
     pub fn spawn_piece(&mut self) {
         self.current_type = self.next_type;
-        self.next_type = random_type();
+        self.next_type = self.bag.next();
         self.current_rotation = 0;
         self.pos = Self::spawn_pos(self.current_type);
         if self.board.is_game_over(self.current_type, self.current_rotation, self.pos) {
             self.game_over = true;
+            self.events.push(GameEvent::GameOver);
         }
+    }
+
+    pub fn hold_swap(&mut self) {
+        if self.game_over || self.paused || self.hold_used || self.is_clearing() {
+            return;
+        }
+        let incoming = match self.hold_type.take() {
+            Some(t) => t,
+            None => {
+                let t = self.next_type;
+                self.next_type = self.bag.next();
+                t
+            }
+        };
+        self.hold_type = Some(self.current_type);
+        self.current_type = incoming;
+        self.current_rotation = 0;
+        self.pos = Self::spawn_pos(incoming);
+        self.hold_used = true;
+        self.fall_timer = 0.0;
+        self.events.push(GameEvent::Held);
+        if self.board.is_game_over(self.current_type, self.current_rotation, self.pos) {
+            self.game_over = true;
+            self.events.push(GameEvent::GameOver);
+        }
+    }
+
+    pub fn ghost_position(&self) -> (i32, i32) {
+        let mut pos = self.pos;
+        while self
+            .board
+            .is_valid_position(self.current_type, self.current_rotation, (pos.0, pos.1 + 1))
+        {
+            pos.1 += 1;
+        }
+        pos
+    }
+
+    pub fn is_clearing(&self) -> bool {
+        self.clear_timer > 0.0
+    }
+
+    pub fn take_events(&mut self) -> Vec<GameEvent> {
+        std::mem::take(&mut self.events)
     }
 
     pub fn move_left(&mut self) -> bool {
@@ -108,25 +178,50 @@ impl Game {
     }
 
     fn lock_and_next(&mut self) {
-        self.board.lock_piece(self.current_type, self.current_rotation, self.pos);
-        let cleared = self.board.clear_lines();
-        if cleared > 0 {
-            self.lines_cleared += cleared;
-            let points = match cleared {
-                1 => 100,
-                2 => 300,
-                3 => 500,
-                _ => 800,
-            };
-            self.score += points * self.level;
-            self.level = 1 + self.lines_cleared / 10;
+        self.board
+            .lock_piece(self.current_type, self.current_rotation, self.pos);
+        self.hold_used = false;
+        let full = self.board.full_rows();
+        if full.is_empty() {
+            self.spawn_piece();
+        } else {
+            self.pending_clear_rows = full;
+            self.clear_timer = CLEAR_DURATION;
+        }
+    }
+
+    fn finish_clearing(&mut self) {
+        self.clear_timer = 0.0;
+        let rows = std::mem::take(&mut self.pending_clear_rows);
+        let cleared = self.board.clear_rows(&rows);
+        self.lines_cleared += cleared;
+        let points = match cleared {
+            1 => 100,
+            2 => 300,
+            3 => 500,
+            _ => 800,
+        } * self.level;
+        self.score += points;
+        self.events.push(GameEvent::LinesCleared { rows, points });
+        let new_level = 1 + self.lines_cleared / 10;
+        if new_level > self.level {
+            self.level = new_level;
             self.fall_interval = (0.8 - (self.level as f64 - 1.0) * 0.07).max(0.1);
+            self.events.push(GameEvent::LevelUp { level: self.level });
         }
         self.spawn_piece();
     }
 
     pub fn tick(&mut self, dt: f64) {
         if self.game_over || self.paused {
+            return;
+        }
+
+        if self.clear_timer > 0.0 {
+            self.clear_timer -= dt;
+            if self.clear_timer <= 0.0 {
+                self.finish_clearing();
+            }
             return;
         }
 
@@ -155,11 +250,21 @@ impl Game {
             return;
         }
 
-        if is_key_pressed(KeyCode::Up) {
-            self.rotate();
+        if self.is_clearing() {
+            return;
+        }
+
+        if is_key_pressed(KeyCode::C) {
+            self.hold_swap();
+            return;
+        }
+
+        if is_key_pressed(KeyCode::Up) && self.rotate() {
+            self.events.push(GameEvent::Rotated);
         }
 
         if is_key_pressed(KeyCode::Space) {
+            self.events.push(GameEvent::HardDropped);
             self.hard_drop();
         }
 
@@ -225,6 +330,89 @@ impl Game {
         self.paused = false;
         self.fall_timer = 0.0;
         self.fall_interval = 0.8;
-        self.spawn_piece();
+        self.hold_type = None;
+        self.hold_used = false;
+        self.clear_timer = 0.0;
+        self.pending_clear_rows.clear();
+        self.events.clear();
+        self.bag = Bag::new();
+        self.current_type = self.bag.next();
+        self.next_type = self.bag.next();
+        self.current_rotation = 0;
+        self.pos = Self::spawn_pos(self.current_type);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hold_swap_moves_current_to_hold_and_spawns_next() {
+        let mut game = Game::new();
+        let current = game.current_type;
+        let next = game.next_type;
+        assert!(game.hold_type.is_none());
+
+        game.hold_swap();
+        assert_eq!(game.hold_type, Some(current));
+        assert_eq!(game.current_type, next);
+        assert!(game.hold_used);
+
+        game.hold_swap();
+        assert_eq!(game.current_type, next);
+        assert_eq!(game.hold_type, Some(current));
+    }
+
+    #[test]
+    fn hold_swap_back_exchanges_pieces() {
+        let mut game = Game::new();
+        let first = game.current_type;
+        game.hold_swap();
+        let second = game.current_type;
+        game.hold_used = false;
+        game.hold_swap();
+        assert_eq!(game.current_type, first);
+        assert_eq!(game.hold_type, Some(second));
+    }
+
+    #[test]
+    fn ghost_position_is_final_landing_spot() {
+        let game = Game::new();
+        let ghost = game.ghost_position();
+        assert!(
+            game.board
+                .is_valid_position(game.current_type, game.current_rotation, ghost)
+        );
+        assert!(
+            !game.board
+                .is_valid_position(game.current_type, game.current_rotation, (ghost.0, ghost.1 + 1))
+        );
+        assert!(ghost.1 >= game.pos.1);
+    }
+
+    #[test]
+    fn clearing_flow_scores_and_spawns_after_delay() {
+        let mut game = Game::new();
+        for col in 0..10 {
+            game.board
+                .lock_piece(TetrominoType::I, 0, (col, 17));
+        }
+        assert_eq!(game.board.full_rows(), vec![18]);
+
+        game.hard_drop();
+        assert!(game.is_clearing());
+        assert_eq!(game.score, 0);
+
+        game.tick(0.36);
+        assert!(!game.is_clearing());
+        assert_eq!(game.lines_cleared, 1);
+        assert_eq!(game.score, 100);
+
+        let events = game.take_events();
+        assert!(matches!(
+            events.as_slice(),
+            [GameEvent::LinesCleared { .. }]
+        ));
     }
 }

@@ -3,10 +3,11 @@ mod game;
 mod scores;
 mod tetromino;
 
-use game::Game;
+use game::{Game, GameEvent};
+use macroquad::audio::{load_sound_from_bytes, play_sound_once, set_sound_volume, Sound};
 use macroquad::prelude::*;
 use scores::{scores_path, HighScores};
-use tetromino::{get_color, get_shape};
+use tetromino::{get_color, get_shape, TetrominoType};
 
 const CELL_SIZE: f32 = 30.0;
 const BOARD_OFFSET_X: f32 = 30.0;
@@ -17,7 +18,7 @@ fn window_conf() -> Conf {
     Conf {
         window_title: "Tetris".to_owned(),
         window_width: 500,
-        window_height: 700,
+        window_height: 790,
         window_resizable: false,
         ..Default::default()
     }
@@ -50,13 +51,84 @@ enum Phase {
 
 const MAX_NAME_LEN: usize = 8;
 
+struct Sfx {
+    rotate: Option<Sound>,
+    hold: Option<Sound>,
+    hard_drop: Option<Sound>,
+    clear: Option<Sound>,
+    level_up: Option<Sound>,
+    game_over: Option<Sound>,
+}
+
+impl Sfx {
+    async fn load() -> Self {
+        async fn one(data: &[u8]) -> Option<Sound> {
+            match load_sound_from_bytes(data).await {
+                Ok(s) => {
+                    set_sound_volume(&s, 0.6);
+                    Some(s)
+                }
+                Err(_) => None,
+            }
+        }
+        Sfx {
+            rotate: one(include_bytes!("../assets/sfx/rotate.wav")).await,
+            hold: one(include_bytes!("../assets/sfx/hold.wav")).await,
+            hard_drop: one(include_bytes!("../assets/sfx/harddrop.wav")).await,
+            clear: one(include_bytes!("../assets/sfx/clear.wav")).await,
+            level_up: one(include_bytes!("../assets/sfx/levelup.wav")).await,
+            game_over: one(include_bytes!("../assets/sfx/gameover.wav")).await,
+        }
+    }
+
+    fn play(&self, sound: &Option<Sound>) {
+        if let Some(s) = sound {
+            play_sound_once(s);
+        }
+    }
+}
+
+struct Popup {
+    text: String,
+    x: f32,
+    y: f32,
+    life: f32,
+    max_life: f32,
+}
+
+impl Popup {
+    fn new(text: String, x: f32, y: f32, life: f32) -> Self {
+        Popup {
+            text,
+            x,
+            y,
+            life,
+            max_life: life,
+        }
+    }
+
+    fn update(&mut self, dt: f32) {
+        self.y -= 40.0 * dt;
+        self.life -= dt;
+    }
+
+    fn draw(&self, font: &Font) {
+        let alpha = (self.life / self.max_life).clamp(0.0, 1.0);
+        let color = Color::from_rgba(255, 220, 100, (alpha * 255.0) as u8);
+        let dims = measure_ui_text(font, &self.text, 18.0);
+        draw_ui_text(font, &self.text, self.x - dims.width / 2.0, self.y, 18.0, color);
+    }
+}
+
 #[macroquad::main(window_conf = "window_conf")]
 async fn main() {
     let font = load_ttf_font_from_bytes(include_bytes!("../assets/menlo_regular.ttf")).unwrap();
+    let sfx = Sfx::load().await;
     let score_path = scores_path();
     let mut highscores = HighScores::load(&score_path);
     let mut game = Game::new();
     let mut phase = Phase::Playing;
+    let mut popups: Vec<Popup> = Vec::new();
 
     loop {
         let dt = get_frame_time() as f64;
@@ -65,6 +137,34 @@ async fn main() {
             Phase::Playing => {
                 game.handle_input(dt);
                 game.tick(dt);
+                for event in game.take_events() {
+                    match event {
+                        GameEvent::Rotated => sfx.play(&sfx.rotate),
+                        GameEvent::HardDropped => sfx.play(&sfx.hard_drop),
+                        GameEvent::Held => sfx.play(&sfx.hold),
+                        GameEvent::LinesCleared { rows, points } => {
+                            sfx.play(&sfx.clear);
+                            let avg_row =
+                                rows.iter().sum::<usize>() as f32 / rows.len() as f32;
+                            popups.push(Popup::new(
+                                format!("+{}", points),
+                                BOARD_OFFSET_X + board::WIDTH as f32 * CELL_SIZE / 2.0,
+                                BOARD_OFFSET_Y + avg_row * CELL_SIZE,
+                                1.0,
+                            ));
+                        }
+                        GameEvent::LevelUp { level } => {
+                            sfx.play(&sfx.level_up);
+                            popups.push(Popup::new(
+                                format!("LEVEL {}!", level),
+                                BOARD_OFFSET_X + board::WIDTH as f32 * CELL_SIZE / 2.0,
+                                BOARD_OFFSET_Y + 240.0,
+                                1.4,
+                            ));
+                        }
+                        GameEvent::GameOver => sfx.play(&sfx.game_over),
+                    }
+                }
                 if game.game_over {
                     if highscores.qualifies(game.score) {
                         phase = Phase::EnteringName(String::new());
@@ -99,11 +199,21 @@ async fn main() {
 
         clear_background(Color::from_rgba(20, 20, 30, 255));
 
+        for popup in popups.iter_mut() {
+            popup.update(dt as f32);
+        }
+        popups.retain(|p| p.life > 0.0);
+
         draw_board_background();
         draw_locked_cells(&game);
+        draw_clearing_flash(&game);
+        draw_ghost_piece(&game);
         draw_current_piece(&game);
         draw_grid_lines();
         draw_panel(&game, &highscores, &font);
+        for popup in &popups {
+            popup.draw(&font);
+        }
 
         match &phase {
             Phase::Playing => {
@@ -151,6 +261,9 @@ fn draw_locked_cells(game: &Game) {
 }
 
 fn draw_current_piece(game: &Game) {
+    if game.is_clearing() {
+        return;
+    }
     let shape = get_shape(game.current_type, game.current_rotation);
     let color = get_color(game.current_type);
     for &(dx, dy) in &shape {
@@ -159,6 +272,55 @@ fn draw_current_piece(game: &Game) {
         if x >= 0 && y >= 0 {
             draw_cell(x as f32, y as f32, color);
         }
+    }
+}
+
+fn draw_ghost_piece(game: &Game) {
+    if game.is_clearing() {
+        return;
+    }
+    let ghost = game.ghost_position();
+    if ghost == game.pos {
+        return;
+    }
+    let color = get_color(game.current_type);
+    let ghost_color = Color::from_rgba(
+        (color.r * 255.0) as u8,
+        (color.g * 255.0) as u8,
+        (color.b * 255.0) as u8,
+        70,
+    );
+    let shape = get_shape(game.current_type, game.current_rotation);
+    for &(dx, dy) in &shape {
+        let x = ghost.0 + dx;
+        let y = ghost.1 + dy;
+        if x >= 0 && y >= 0 {
+            draw_rectangle(
+                BOARD_OFFSET_X + x as f32 * CELL_SIZE,
+                BOARD_OFFSET_Y + y as f32 * CELL_SIZE,
+                CELL_SIZE,
+                CELL_SIZE,
+                ghost_color,
+            );
+        }
+    }
+}
+
+fn draw_clearing_flash(game: &Game) {
+    if !game.is_clearing() {
+        return;
+    }
+    let t = (game.clear_timer / game::CLEAR_DURATION) as f32;
+    let alpha = (t * 200.0) as u8;
+    let color = Color::from_rgba(255, 255, 255, alpha);
+    for &row in &game.pending_clear_rows {
+        draw_rectangle(
+            BOARD_OFFSET_X,
+            BOARD_OFFSET_Y + row as f32 * CELL_SIZE,
+            board::WIDTH as f32 * CELL_SIZE,
+            CELL_SIZE,
+            color,
+        );
     }
 }
 
@@ -214,14 +376,46 @@ fn draw_cell(col: f32, row: f32, color: Color) {
     draw_rectangle(x + CELL_SIZE - border, y, border, CELL_SIZE, shadow);
 }
 
+fn draw_piece_preview(t: TetrominoType, bx: f32, by: f32, w: f32, h: f32, dim: bool) {
+    let shape = get_shape(t, 0);
+    let color = if dim {
+        Color::from_rgba(100, 100, 110, 255)
+    } else {
+        get_color(t)
+    };
+    let min_cx = shape.iter().map(|&(cx, _)| cx).min().unwrap_or(0);
+    let min_cy = shape.iter().map(|&(_, cy)| cy).min().unwrap_or(0);
+    let max_cx = shape.iter().map(|&(cx, _)| cx).max().unwrap_or(0);
+    let max_cy = shape.iter().map(|&(_, cy)| cy).max().unwrap_or(0);
+    let pw = (max_cx - min_cx + 1) as f32;
+    let ph = (max_cy - min_cy + 1) as f32;
+    let offset_px = (w - pw) / 2.0;
+    let offset_py = (h - ph) / 2.0;
+
+    for &(dx, dy) in &shape {
+        let px = bx + (dx - min_cx) as f32 * CELL_SIZE + offset_px * CELL_SIZE;
+        let py = by + (dy - min_cy) as f32 * CELL_SIZE + offset_py * CELL_SIZE;
+        draw_rectangle(px + 1.0, py + 1.0, CELL_SIZE - 2.0, CELL_SIZE - 2.0, color);
+    }
+}
+
 fn draw_panel(game: &Game, highscores: &HighScores, font: &Font) {
     let text_color = WHITE;
     let label_color = Color::from_rgba(160, 160, 180, 255);
+    let panel_bg = Color::from_rgba(30, 30, 45, 255);
     let x = PANEL_X;
     let mut y = 40.0f32;
 
     draw_ui_text(font, "TETRIS", x, y, 28.0, text_color);
     y += 45.0;
+
+    draw_ui_text(font, "HOLD", x, y, 14.0, label_color);
+    y += 20.0;
+    draw_rectangle(x + 5.0, y - 5.0, 4.0 * CELL_SIZE, 2.0 * CELL_SIZE + 10.0, panel_bg);
+    if let Some(t) = game.hold_type {
+        draw_piece_preview(t, x + 10.0, y, 4.0, 2.0, game.hold_used);
+    }
+    y += 2.0 * CELL_SIZE + 15.0;
 
     draw_ui_text(font, "SCORE", x, y, 16.0, label_color);
     y += 22.0;
@@ -241,32 +435,8 @@ fn draw_panel(game: &Game, highscores: &HighScores, font: &Font) {
     draw_ui_text(font, "NEXT", x, y, 16.0, label_color);
     y += 25.0;
 
-    let preview_x = x + 10.0;
-    let preview_y = y;
-    draw_rectangle(
-        preview_x - 5.0,
-        preview_y - 5.0,
-        5.0 * CELL_SIZE,
-        4.0 * CELL_SIZE,
-        Color::from_rgba(30, 30, 45, 255),
-    );
-
-    let shape = get_shape(game.next_type, 0);
-    let color = get_color(game.next_type);
-    let min_cx = shape.iter().map(|&(cx, _)| cx).min().unwrap_or(0);
-    let min_cy = shape.iter().map(|&(_, cy)| cy).min().unwrap_or(0);
-    let max_cx = shape.iter().map(|&(cx, _)| cx).max().unwrap_or(0);
-    let max_cy = shape.iter().map(|&(_, cy)| cy).max().unwrap_or(0);
-    let pw = (max_cx - min_cx + 1) as f32;
-    let ph = (max_cy - min_cy + 1) as f32;
-    let offset_px = (5.0 - pw) / 2.0;
-    let offset_py = (4.0 - ph) / 2.0;
-
-    for &(dx, dy) in &shape {
-        let px = preview_x + (dx - min_cx) as f32 * CELL_SIZE + offset_px * CELL_SIZE;
-        let py = preview_y + (dy - min_cy) as f32 * CELL_SIZE + offset_py * CELL_SIZE;
-        draw_rectangle(px + 1.0, py + 1.0, CELL_SIZE - 2.0, CELL_SIZE - 2.0, color);
-    }
+    draw_rectangle(x + 5.0, y - 5.0, 5.0 * CELL_SIZE, 4.0 * CELL_SIZE + 10.0, panel_bg);
+    draw_piece_preview(game.next_type, x + 10.0, y, 5.0, 4.0, false);
 
     y += 4.0 * CELL_SIZE + 20.0;
     draw_ui_text(font, "TOP 3", x, y, 14.0, label_color);
@@ -290,6 +460,7 @@ fn draw_panel(game: &Game, highscores: &HighScores, font: &Font) {
         ("\u{2191}  Rotate", 13.0),
         ("\u{2193}  Soft Drop", 13.0),
         ("Space  Hard Drop", 13.0),
+        ("C  Hold", 13.0),
         ("P  Pause", 13.0),
         ("R  Restart", 13.0),
     ];
